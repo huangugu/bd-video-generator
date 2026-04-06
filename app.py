@@ -7,23 +7,17 @@ from PIL import Image
 def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
     """
     Détecte les cases de BD automatiquement en utilisant les contours OpenCV.
-    Retourne une liste de coordonnées (x, y, w, h) pour chaque case.
     """
     height, width, _ = img_array.shape
     gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
     
-    # Réduction du bruit
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Détection des bords
     edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
     
-    # Dilatation pour fermer les contours
     kernel = np.ones((3, 3), np.uint8)
     dilated_edges = cv2.dilate(edges, kernel, iterations=2)
     closed_edges = cv2.erode(dilated_edges, kernel, iterations=1)
     
-    # Trouver les contours
     contours, _ = cv2.findContours(closed_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     panels = []
@@ -35,11 +29,9 @@ def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
         x, y, w, h = cv2.boundingRect(cnt)
         area = w * h
         
-        # Filtrer par taille et proportion
         if min_area < area < max_area:
             aspect_ratio = w / float(h)
-            if 0.3 < aspect_ratio < 3.0:  # Éviter les lignes trop fines
-                # Ajout d'une marge pour inclure les bordures
+            if 0.3 < aspect_ratio < 3.0:
                 margin = 5
                 panels.append({
                     'x': max(0, x - margin),
@@ -48,8 +40,6 @@ def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
                     'h': min(height - y, h + 2 * margin)
                 })
     
-    # Trier les cases : de haut en bas, puis gauche à droite
-    # On groupe par ligne horizontale (tolérance de 10% de la hauteur)
     panels.sort(key=lambda p: p['y'])
     
     sorted_panels = []
@@ -72,9 +62,34 @@ def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
     
     return sorted_panels
 
-def generate_comic_video_with_panels(img_array, panels, duration_per_panel, zoom_factor=1.2):
+def add_letterbox(frame, target_width, target_height):
     """
-    Génère la vidéo en parcourant les cases détectées avec effet de zoom.
+    Ajoute des bandes noires pour maintenir le ratio d'aspect sans déformation.
+    """
+    frame_h, frame_w = frame.shape[:2]
+    
+    # Calcul du ratio pour remplir sans déformer
+    ratio = min(target_width / frame_w, target_height / frame_h)
+    new_w = int(frame_w * ratio)
+    new_h = int(frame_h * ratio)
+    
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Créer un fond noir
+    letterboxed = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    
+    # Centrer l'image
+    x_offset = (target_width - new_w) // 2
+    y_offset = (target_height - new_h) // 2
+    
+    letterboxed[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+    
+    return letterboxed
+
+def generate_comic_video_with_panels(img_array, panels, duration_per_panel, zoom_factor=1.2, background_mode="black"):
+    """
+    Génère la vidéo avec conservation des couleurs et ratios.
+    background_mode: "black" ou "full_page"
     """
     height, width, _ = img_array.shape
     fps = 30
@@ -97,28 +112,35 @@ def generate_comic_video_with_panels(img_array, panels, duration_per_panel, zoom
     for i, panel in enumerate(panels):
         x, y, w, h = panel['x'], panel['y'], panel['w'], panel['h']
         
-        # Calcul du zoom centré sur la case
-        center_x = x + w // 2
-        center_y = y + h // 2
+        if background_mode == "black":
+            # Mode fond noir : zoom sur la case avec letterbox
+            center_x = x + w // 2
+            center_y = y + h // 2
+            
+            zoom_w = int(w / zoom_factor)
+            zoom_h = int(h / zoom_factor)
+            
+            zoom_x_start = max(0, center_x - zoom_w // 2)
+            zoom_y_start = max(0, center_y - zoom_h // 2)
+            zoom_x_end = min(width, zoom_x_start + zoom_w)
+            zoom_y_end = min(height, zoom_y_start + zoom_h)
+            
+            zoomed_region = img_array[zoom_y_start:zoom_y_end, zoom_x_start:zoom_x_end]
+            
+            # Letterbox pour maintenir le ratio sans déformation
+            final_frame = add_letterbox(zoomed_region, width, height)
+            
+        else:  # background_mode == "full_page"
+            # Mode page complète : montre toute la BD avec cadre vert sur la case
+            final_frame = img_array.copy()
+            cv2.rectangle(final_frame, (x, y), (x + w, y + h), (0, 255, 0), 8)
         
-        zoom_w = int(w / zoom_factor)
-        zoom_h = int(h / zoom_factor)
-        
-        zoom_x_start = max(0, center_x - zoom_w // 2)
-        zoom_y_start = max(0, center_y - zoom_h // 2)
-        zoom_x_end = min(width, zoom_x_start + zoom_w)
-        zoom_y_end = min(height, zoom_y_start + zoom_h)
-        
-        # Extraction et redimensionnement
-        zoomed_region = img_array[zoom_y_start:zoom_y_end, zoom_x_start:zoom_x_end]
-        resized_frame = cv2.resize(zoomed_region, (width, height), interpolation=cv2.INTER_AREA)
-        
-        # Numéro de case
-        cv2.putText(resized_frame, f"Case {i+1}/{total_panels}", (20, 40), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        # Numéro de case (optionnel, discret)
+        cv2.putText(final_frame, f"{i+1}/{total_panels}", (width - 100, 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         
         for _ in range(total_frames):
-            out.write(resized_frame)
+            out.write(final_frame)
         
         progress_bar.progress((i + 1) / total_panels)
     
@@ -140,7 +162,7 @@ st.set_page_config(page_title="Générateur Vidéo BD - IA", layout="wide")
 
 st.title("🤖 Générateur de Vidéo BD avec Détection IA")
 st.markdown("""
-Détection automatique des cases par contour • Zoom intelligent • Parcours naturel de lecture
+Détection automatique • **Couleurs originales préservées** • **Ratio d'aspect respecté** • Zoom intelligent
 """)
 
 uploaded_file = st.file_uploader("Choisissez une planche de BD (PNG, JPG)", type=["png", "jpg", "jpeg"])
@@ -174,17 +196,21 @@ if uploaded_file is not None:
         duration = st.slider("Durée par case (sec)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
         zoom = st.slider("Facteur de zoom", min_value=1.0, max_value=3.0, value=1.2, step=0.1)
         
+        background_mode = st.radio(
+            "Style de fond",
+            ["Fond noir (zoom plein écran)", "Page complète (case surlignée)"],
+            index=0
+        )
+        
         min_area = st.slider("Sensibilité détection (min)", min_value=0.01, max_value=0.2, value=0.05, step=0.01)
         max_area = st.slider("Sensibilité détection (max)", min_value=0.2, max_value=0.8, value=0.4, step=0.05)
 
     st.divider()
 
-    # Détection et aperçu
     if detection_mode == "Automatique (IA)":
         panels = detect_panels(img_array, min_area, max_area)
         mode_info = f"🤖 **{len(panels)} cases détectées automatiquement**"
     else:
-        # Mode grille manuel
         h, w, _ = img_array.shape
         panel_w, panel_h = w // cols, h // rows
         panels = []
@@ -199,10 +225,14 @@ if uploaded_file is not None:
         preview_img = draw_panel_preview(img_array, panels)
         st.image(preview_img, caption="Aperçu des cases détectées (numérotées dans l'ordre de lecture)", use_column_width=True)
         
-        if st.button(" Générer la vidéo", type="primary", use_container_width=True):
+        background_value = "black" if "Fond noir" in background_mode else "full_page"
+        
+        if st.button("🎬 Générer la vidéo", type="primary", use_container_width=True):
             with st.spinner('Génération de la vidéo en cours...'):
                 try:
-                    video_path = generate_comic_video_with_panels(img_array, panels, duration, zoom)
+                    video_path = generate_comic_video_with_panels(
+                        img_array, panels, duration, zoom, background_value
+                    )
                     
                     if video_path:
                         st.success("✅ Vidéo générée avec succès !")
@@ -218,6 +248,7 @@ if uploaded_file is not None:
                             )
                 except Exception as e:
                     st.error(f"Erreur : {e}")
+                    st.code(str(e))
     else:
         st.warning("⚠️ Aucune case détectée. Essayez d'ajuster la sensibilité ou passez en mode Manuel.")
 
@@ -227,7 +258,8 @@ else:
     st.markdown("""
     ### ✨ Fonctionnalités
     - **Détection IA** : Contours et formes rectangulaires
-    - **Tri intelligent** : Ordre de lecture naturel (gauche→droite, haut→bas)
-    - **Zoom fluide** : Centré sur chaque case
-    - **Mode manuel** : Grille classique si besoin
+    - **Couleurs originales** : Aucune altération des couleurs
+    - **Ratio préservé** : Pas de déformation (letterbox si nécessaire)
+    - **Deux styles** : Fond noir OU page complète avec surlignage
+    - **Tri intelligent** : Ordre de lecture naturel
     """)
