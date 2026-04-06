@@ -62,38 +62,69 @@ def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
     
     return sorted_panels
 
-def add_letterbox(frame, target_width, target_height):
-    """
-    Ajoute des bandes noires pour maintenir le ratio d'aspect sans déformation.
-    """
-    frame_h, frame_w = frame.shape[:2]
-    
-    # Calcul du ratio pour remplir sans déformer
-    ratio = min(target_width / frame_w, target_height / frame_h)
-    new_w = int(frame_w * ratio)
-    new_h = int(frame_h * ratio)
-    
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    
-    # Créer un fond noir
-    letterboxed = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-    
-    # Centrer l'image
-    x_offset = (target_width - new_w) // 2
-    y_offset = (target_height - new_h) // 2
-    
-    letterboxed[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
-    
-    return letterboxed
+def zoom_interpolate(start_scale, end_scale, progress):
+    """Interpolation fluide pour le zoom avec easing."""
+    # Ease in-out pour un mouvement plus naturel
+    if progress < 0.5:
+        ease = 2 * progress * progress
+    else:
+        ease = 1 - pow(-2 * progress + 2, 2) / 2
+    return start_scale + (end_scale - start_scale) * ease
 
-def generate_comic_video_with_panels(img_array, panels, duration_per_panel, zoom_factor=1.2, background_mode="black"):
+def create_zoom_frame(img_array, center_x, center_y, scale, target_width, target_height):
     """
-    Génère la vidéo avec conservation des couleurs et ratios.
-    background_mode: "black" ou "full_page"
+    Crée une frame avec zoom centré sur un point.
+    scale = 1.0 → vue complète, scale > 1.0 → zoomé
+    """
+    height, width, _ = img_array.shape
+    
+    # Calcul de la zone à extraire selon le zoom
+    view_w = int(width / scale)
+    view_h = int(height / scale)
+    
+    # Centrer sur le point cible
+    x_start = max(0, int(center_x - view_w / 2))
+    y_start = max(0, int(center_y - view_h / 2))
+    x_end = min(width, x_start + view_w)
+    y_end = min(height, y_start + view_h)
+    
+    # Ajuster si on atteint les bords
+    if x_end - x_start < view_w:
+        if x_start == 0:
+            x_end = min(width, view_w)
+        else:
+            x_start = max(0, x_end - view_w)
+    
+    if y_end - y_start < view_h:
+        if y_start == 0:
+            y_end = min(height, view_h)
+        else:
+            y_start = max(0, y_end - view_h)
+    
+    cropped = img_array[y_start:y_end, x_start:x_end]
+    
+    # Redimensionner pour remplir l'écran (sans déformation car on garde le ratio de l'image originale)
+    resized = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    
+    return resized
+
+def generate_comic_video_cinematic(img_array, panels, duration_per_panel, max_zoom=2.0):
+    """
+    Génère une vidéo avec effet de caméra cinématique :
+    - Vue complète de la page
+    - Zoom fluide vers la case
+    - Pause sur la case
+    - Dézoom vers vue complète
+    - Transition vers la case suivante
     """
     height, width, _ = img_array.shape
     fps = 30
-    total_frames = int(duration_per_panel * fps)
+    total_panels = len(panels)
+    
+    # Découpage du temps par case
+    zoom_in_frames = int(duration_per_panel * fps * 0.3)  # 30% pour zoomer
+    hold_frames = int(duration_per_panel * fps * 0.4)      # 40% en zoom
+    zoom_out_frames = int(duration_per_panel * fps * 0.3)  # 30% pour dézoomer
     
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     output_path = temp_file.name
@@ -107,40 +138,32 @@ def generate_comic_video_with_panels(img_array, panels, duration_per_panel, zoom
         return None
     
     progress_bar = st.progress(0)
-    total_panels = len(panels)
     
     for i, panel in enumerate(panels):
         x, y, w, h = panel['x'], panel['y'], panel['w'], panel['h']
         
-        if background_mode == "black":
-            # Mode fond noir : zoom sur la case avec letterbox
-            center_x = x + w // 2
-            center_y = y + h // 2
-            
-            zoom_w = int(w / zoom_factor)
-            zoom_h = int(h / zoom_factor)
-            
-            zoom_x_start = max(0, center_x - zoom_w // 2)
-            zoom_y_start = max(0, center_y - zoom_h // 2)
-            zoom_x_end = min(width, zoom_x_start + zoom_w)
-            zoom_y_end = min(height, zoom_y_start + zoom_h)
-            
-            zoomed_region = img_array[zoom_y_start:zoom_y_end, zoom_x_start:zoom_x_end]
-            
-            # Letterbox pour maintenir le ratio sans déformation
-            final_frame = add_letterbox(zoomed_region, width, height)
-            
-        else:  # background_mode == "full_page"
-            # Mode page complète : montre toute la BD avec cadre vert sur la case
-            final_frame = img_array.copy()
-            cv2.rectangle(final_frame, (x, y), (x + w, y + h), (0, 255, 0), 8)
+        # Centre de la case
+        center_x = x + w // 2
+        center_y = y + h // 2
         
-        # Numéro de case (optionnel, discret)
-        cv2.putText(final_frame, f"{i+1}/{total_panels}", (width - 100, 40), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        # 1. ZOOM IN (de la vue complète vers la case)
+        for frame_idx in range(zoom_in_frames):
+            progress = frame_idx / zoom_in_frames
+            scale = zoom_interpolate(1.0, max_zoom, progress)
+            frame = create_zoom_frame(img_array, center_x, center_y, scale, width, height)
+            out.write(frame)
         
-        for _ in range(total_frames):
-            out.write(final_frame)
+        # 2. HOLD (maintenir le zoom sur la case)
+        for frame_idx in range(hold_frames):
+            frame = create_zoom_frame(img_array, center_x, center_y, max_zoom, width, height)
+            out.write(frame)
+        
+        # 3. ZOOM OUT (retour à la vue complète)
+        for frame_idx in range(zoom_out_frames):
+            progress = frame_idx / zoom_out_frames
+            scale = zoom_interpolate(max_zoom, 1.0, progress)
+            frame = create_zoom_frame(img_array, center_x, center_y, scale, width, height)
+            out.write(frame)
         
         progress_bar.progress((i + 1) / total_panels)
     
@@ -158,11 +181,11 @@ def draw_panel_preview(img_array, panels):
     return preview
 
 # --- Interface Streamlit ---
-st.set_page_config(page_title="Générateur Vidéo BD - IA", layout="wide")
+st.set_page_config(page_title="Générateur Vidéo BD - Cinématique", layout="wide")
 
-st.title("🤖 Générateur de Vidéo BD avec Détection IA")
+st.title("🎬 Générateur de Vidéo BD - Effet Cinématique")
 st.markdown("""
-Détection automatique • **Couleurs originales préservées** • **Ratio d'aspect respecté** • Zoom intelligent
+**Détection IA** • **Zoom fluide avec la caméra** • **Pas de surlignage** • **Couleurs et ratios préservés**
 """)
 
 uploaded_file = st.file_uploader("Choisissez une planche de BD (PNG, JPG)", type=["png", "jpg", "jpeg"])
@@ -193,15 +216,9 @@ if uploaded_file is not None:
         cols = st.number_input("Colonnes (mode manuel)", min_value=1, max_value=10, value=3)
         rows = st.number_input("Lignes (mode manuel)", min_value=1, max_value=10, value=4)
         
-        duration = st.slider("Durée par case (sec)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
-        zoom = st.slider("Facteur de zoom", min_value=1.0, max_value=3.0, value=1.2, step=0.1)
-        
-        background_mode = st.radio(
-            "Style de fond",
-            ["Fond noir (zoom plein écran)", "Page complète (case surlignée)"],
-            index=0
-        )
-        
+        duration = st.slider("Durée par case (sec)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+        max_zoom = st.slider("Niveau de zoom max", min_value=1.5, max_value=5.0, value=2.5, step=0.5)
+
         min_area = st.slider("Sensibilité détection (min)", min_value=0.01, max_value=0.2, value=0.05, step=0.01)
         max_area = st.slider("Sensibilité détection (max)", min_value=0.2, max_value=0.8, value=0.4, step=0.05)
 
@@ -225,14 +242,10 @@ if uploaded_file is not None:
         preview_img = draw_panel_preview(img_array, panels)
         st.image(preview_img, caption="Aperçu des cases détectées (numérotées dans l'ordre de lecture)", use_column_width=True)
         
-        background_value = "black" if "Fond noir" in background_mode else "full_page"
-        
-        if st.button("🎬 Générer la vidéo", type="primary", use_container_width=True):
-            with st.spinner('Génération de la vidéo en cours...'):
+        if st.button("🎬 Générer la vidéo cinématique", type="primary", use_container_width=True):
+            with st.spinner('Génération de la vidéo en cours... Cela peut prendre quelques minutes.'):
                 try:
-                    video_path = generate_comic_video_with_panels(
-                        img_array, panels, duration, zoom, background_value
-                    )
+                    video_path = generate_comic_video_cinematic(img_array, panels, duration, max_zoom)
                     
                     if video_path:
                         st.success("✅ Vidéo générée avec succès !")
@@ -242,7 +255,7 @@ if uploaded_file is not None:
                             st.download_button(
                                 label="📥 Télécharger la vidéo (MP4)",
                                 data=file,
-                                file_name="bd_video_ia.mp4",
+                                file_name="bd_video_cinematique.mp4",
                                 mime="video/mp4",
                                 use_container_width=True
                             )
@@ -257,9 +270,10 @@ else:
     
     st.markdown("""
     ### ✨ Fonctionnalités
-    - **Détection IA** : Contours et formes rectangulaires
-    - **Couleurs originales** : Aucune altération des couleurs
-    - **Ratio préservé** : Pas de déformation (letterbox si nécessaire)
-    - **Deux styles** : Fond noir OU page complète avec surlignage
-    - **Tri intelligent** : Ordre de lecture naturel
+    - **Effet cinématique** : La caméra zoome et dézoome sur chaque case
+    - **Mouvement fluide** : Transitions douces avec easing
+    - **Aucun surlignage** : Juste la caméra qui se déplace
+    - **Couleurs originales** : Aucune altération
+    - **Ratio préservé** : Pas de déformation
+    - **Détection IA** : Ou mode grille manuel
     """)
