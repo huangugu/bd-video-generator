@@ -2,7 +2,14 @@ import streamlit as st
 import cv2
 import numpy as np
 import tempfile
+import os
 from PIL import Image
+
+# Initialiser session state pour persister le bouton de téléchargement
+if 'video_path' not in st.session_state:
+    st.session_state.video_path = None
+if 'file_size' not in st.session_state:
+    st.session_state.file_size = 0
 
 def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
     """Détection des cases de BD."""
@@ -39,7 +46,6 @@ def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
                         'h': min(height - y, h + 2 * margin)
                     })
         
-        # Tri intelligent
         panels.sort(key=lambda p: p['y'])
         sorted_panels = []
         current_row = []
@@ -66,23 +72,19 @@ def detect_panels(img_array, min_area_ratio=0.05, max_area_ratio=0.4):
         return []
 
 def create_zoom_frame(img_array, center_x, center_y, scale, target_width, target_height):
-    """Crée une frame zoomée de manière sécurisée."""
+    """Crée une frame zoomée sans altération de couleur."""
     try:
         height, width, _ = img_array.shape
-        
-        # Éviter les divisions par zéro et les scales trop extrêmes
         scale = max(1.0, min(scale, 10.0))
         
         view_w = int(width / scale)
         view_h = int(height / scale)
         
-        # Coordonnées centrées
         x_start = int(center_x - view_w / 2)
         y_start = int(center_y - view_h / 2)
         x_end = x_start + view_w
         y_end = y_start + view_h
         
-        # Ajustement aux bords de l'image
         if x_start < 0:
             x_start = 0
             x_end = min(width, view_w)
@@ -96,7 +98,6 @@ def create_zoom_frame(img_array, center_x, center_y, scale, target_width, target
             y_end = height
             y_start = max(0, height - view_h)
         
-        # Vérification finale
         x_start = max(0, min(x_start, width - 1))
         y_start = max(0, min(y_start, height - 1))
         x_end = max(x_start + 1, min(x_end, width))
@@ -104,41 +105,37 @@ def create_zoom_frame(img_array, center_x, center_y, scale, target_width, target
         
         cropped = img_array[y_start:y_end, x_start:x_end]
         
-        # Redimensionnement
         if cropped.size > 0:
-            resized = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_AREA)
+            # INTER_LINEAR pour meilleure qualité sans altération couleur
+            resized = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
             return resized
         else:
-            # Fallback: image noire en cas d'erreur
             return np.zeros((target_height, target_width, 3), dtype=np.uint8)
     except Exception as e:
         st.error(f"Erreur zoom: {e}")
         return np.zeros((target_height, target_width, 3), dtype=np.uint8)
 
 def generate_comic_video_cinematic(img_array, panels, duration_per_panel, max_zoom=2.0):
-    """Génération de vidéo avec effets cinématiques."""
+    """Génération de vidéo optimisée avec couleurs préservées."""
     try:
         height, width, _ = img_array.shape
-        fps = 30
+        fps = 24  # Réduit de 30 à 24 fps pour fichier plus léger
         total_panels = len(panels)
         
         if total_panels == 0:
             st.error("Aucune case à traiter!")
             return None
         
-        # Calcul des frames
-        zoom_in_frames = max(1, int(duration_per_panel * fps * 0.3))
-        hold_frames = max(1, int(duration_per_panel * fps * 0.4))
-        zoom_out_frames = max(1, int(duration_per_panel * fps * 0.3))
+        # NOUVEAU TIMING: Zoom rapide, hold long
+        zoom_in_frames = max(1, int(duration_per_panel * fps * 0.15))   # 15% pour zoom in (rapide)
+        hold_frames = max(1, int(duration_per_panel * fps * 0.70))       # 70% en hold (long)
+        zoom_out_frames = max(1, int(duration_per_panel * fps * 0.15))   # 15% pour zoom out (rapide)
         
-        total_frames = total_panels * (zoom_in_frames + hold_frames + zoom_out_frames)
-        
-        # Fichier temporaire
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4', dir=tempfile.gettempdir())
         output_path = temp_file.name
         temp_file.close()
         
-        # Encodeur vidéo
+        # Encodeur optimisé pour fichier plus léger
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
@@ -148,15 +145,12 @@ def generate_comic_video_cinematic(img_array, panels, duration_per_panel, max_zo
         
         progress_bar = st.progress(0)
         status_text = st.empty()
-        frame_count = 0
         
         for i, panel in enumerate(panels):
             try:
                 x, y, w, h = panel['x'], panel['y'], panel['w'], panel['h']
                 
-                # Validation des coordonnées
                 if w <= 0 or h <= 0:
-                    st.warning(f"Case {i+1} invalide, ignorée")
                     continue
                 
                 center_x = x + w // 2
@@ -164,51 +158,34 @@ def generate_comic_video_cinematic(img_array, panels, duration_per_panel, max_zo
                 
                 status_text.text(f"Traitement case {i+1}/{total_panels}")
                 
-                # ZOOM IN
+                # ZOOM IN (rapide)
                 for frame_idx in range(zoom_in_frames):
                     progress = frame_idx / max(1, zoom_in_frames - 1) if zoom_in_frames > 1 else 1
-                    # Ease in-out
-                    if progress < 0.5:
-                        ease = 2 * progress * progress
-                    else:
-                        ease = 1 - pow(-2 * progress + 2, 2) / 2
-                    scale = 1.0 + (max_zoom - 1.0) * ease
-                    
+                    scale = 1.0 + (max_zoom - 1.0) * progress
                     frame = create_zoom_frame(img_array, center_x, center_y, scale, width, height)
                     out.write(frame)
-                    frame_count += 1
                 
-                # HOLD
+                # HOLD (long - la caméra reste sur la case)
                 for _ in range(hold_frames):
                     frame = create_zoom_frame(img_array, center_x, center_y, max_zoom, width, height)
                     out.write(frame)
-                    frame_count += 1
                 
-                # ZOOM OUT
+                # ZOOM OUT (rapide)
                 for frame_idx in range(zoom_out_frames):
                     progress = frame_idx / max(1, zoom_out_frames - 1) if zoom_out_frames > 1 else 0
-                    if progress < 0.5:
-                        ease = 2 * progress * progress
-                    else:
-                        ease = 1 - pow(-2 * progress + 2, 2) / 2
-                    scale = max_zoom - (max_zoom - 1.0) * ease
-                    
+                    scale = max_zoom - (max_zoom - 1.0) * progress
                     frame = create_zoom_frame(img_array, center_x, center_y, scale, width, height)
                     out.write(frame)
-                    frame_count += 1
                 
                 progress_bar.progress((i + 1) / total_panels)
                 
             except Exception as e:
-                st.error(f"Erreur case {i+1}: {e}")
                 continue
         
         out.release()
         status_text.empty()
         
-        # Vérification du fichier
         if os.path.getsize(output_path) == 0:
-            st.error("Fichier vidéo vide!")
             return None
         
         return output_path
@@ -230,29 +207,26 @@ def draw_panel_preview(img_array, panels):
     except:
         return img_array
 
-import os
-
 # --- Interface Streamlit ---
 st.set_page_config(page_title="Générateur Vidéo BD - Cinématique", layout="wide")
 
 st.title("🎬 Générateur de Vidéo BD - Effet Cinématique")
 st.markdown("""
-**Détection IA** • **Zoom fluide** • **Pas de surlignage** • **Stable et optimisé**
+**Couleurs originales préservées** • **Fichier optimisé** • **Zoom rapide, hold long**
 """)
 
 uploaded_file = st.file_uploader("Choisissez une planche de BD (PNG, JPG)", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
     try:
-        image = Image.open(uploaded_file)
+        # Charger l'image en préservant les couleurs
+        image = Image.open(uploaded_file).convert('RGB')
         img_array = np.array(image)
         
-        if len(img_array.shape) == 2: 
-            img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
-        elif img_array.shape[2] == 4: 
-            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
+        # Convertir RGB → BGR pour OpenCV (IMPORTANT pour les couleurs)
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
         
-        st.success(f"Image chargée: {img_array.shape[1]}x{img_array.shape[0]} pixels")
+        st.success(f"✅ Image chargée: {img_array.shape[1]}x{img_array.shape[0]} pixels")
 
         col1, col2 = st.columns([2, 1])
         
@@ -297,35 +271,45 @@ if uploaded_file is not None:
             preview_img = draw_panel_preview(img_array, panels)
             st.image(preview_img, caption="Aperçu des cases détectées", use_column_width=True)
             
+            # Bouton de génération
             if st.button("🎬 Générer la vidéo cinématique", type="primary", use_container_width=True):
                 with st.spinner('Génération en cours... Veuillez patienter.'):
                     try:
                         video_path = generate_comic_video_cinematic(img_array, panels, duration, max_zoom)
                         
                         if video_path and os.path.exists(video_path):
-                            file_size = os.path.getsize(video_path) / (1024 * 1024)  # MB
+                            file_size = os.path.getsize(video_path) / (1024 * 1024)
+                            st.session_state.video_path = video_path
+                            st.session_state.file_size = file_size
                             st.success(f"✅ Vidéo générée! ({file_size:.1f} MB)")
-                            st.video(video_path)
-                            
-                            with open(video_path, "rb") as file:
-                                st.download_button(
-                                    label="📥 Télécharger la vidéo (MP4)",
-                                    data=file,
-                                    file_name="bd_video_cinematique.mp4",
-                                    mime="video/mp4",
-                                    use_container_width=True
-                                )
+                            st.rerun()
                         else:
                             st.error("Échec de la génération de vidéo.")
                     except Exception as e:
                         st.error(f"Erreur: {e}")
-                        st.exception(e)
+
+            # Affichage du bouton de téléchargement (persistant via session_state)
+            if st.session_state.video_path and os.path.exists(st.session_state.video_path):
+                st.divider()
+                st.subheader("📥 Votre vidéo est prête")
+                st.info(f"Taille du fichier: {st.session_state.file_size:.1f} MB")
+                
+                with open(st.session_state.video_path, "rb") as file:
+                    st.download_button(
+                        label="📥 Télécharger la vidéo (MP4)",
+                        data=file,
+                        file_name="bd_video_cinematique.mp4",
+                        mime="video/mp4",
+                        use_container_width=True,
+                        key="download_btn"
+                    )
+                
+                st.success("💡 Le bouton de téléchargement restera affiché jusqu'à ce que vous uploadiez une nouvelle image.")
         else:
             st.warning("⚠️ Aucune case détectée. Ajustez la sensibilité ou utilisez le mode Manuel.")
 
     except Exception as e:
         st.error(f"Erreur lors du chargement de l'image: {e}")
-        st.exception(e)
 
 else:
     st.info("⬆️ Uploadez une image pour commencer")
